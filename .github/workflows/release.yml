@@ -1,0 +1,408 @@
+# =============================================================================
+#  Codoco -- unified release pipeline
+#
+#  One tag -> binaries + .deb + .rpm -> single GitHub Release
+#  https://github.com/RaptorVampire/Codoco
+# =============================================================================
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: codoco
+
+# =============================================================================
+jobs:
+  # ---------------------------------------------------------------------------
+  #  Portable binaries (tar.gz / zip per platform)
+  # ---------------------------------------------------------------------------
+  binaries:
+    name: binary / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Linux ----
+          - { target: linux-x86_64,        runner: ubuntu-latest, cc: gcc }
+          - { target: linux-i686,          runner: ubuntu-latest,
+              cc: i686-linux-gnu-gcc,
+              pkg: "gcc-i686-linux-gnu libc6-dev-i386-cross" }
+          - { target: linux-aarch64,       runner: ubuntu-latest,
+              cc: aarch64-linux-gnu-gcc,
+              pkg: "gcc-aarch64-linux-gnu libc6-dev-arm64-cross" }
+          - { target: linux-armv7,         runner: ubuntu-latest,
+              cc: arm-linux-gnueabihf-gcc,
+              pkg: "gcc-arm-linux-gnueabihf libc6-dev-armhf-cross" }
+          - { target: linux-riscv64,       runner: ubuntu-latest,
+              cc: riscv64-linux-gnu-gcc,
+              pkg: "gcc-riscv64-linux-gnu libc6-dev-riscv64-cross" }
+          - { target: linux-ppc64le,       runner: ubuntu-latest,
+              cc: powerpc64le-linux-gnu-gcc,
+              pkg: "gcc-powerpc64le-linux-gnu libc6-dev-ppc64el-cross" }
+          - { target: linux-s390x,         runner: ubuntu-latest,
+              cc: s390x-linux-gnu-gcc,
+              pkg: "gcc-s390x-linux-gnu libc6-dev-s390x-cross" }
+          # ---- Linux static ----
+          - { target: linux-x86_64-static, runner: ubuntu-latest,
+              cc: musl-gcc, musl: true }
+          # ---- macOS (both from macos-14, cross via -arch) ----
+          - { target: macos-x86_64,        runner: macos-14, cc: clang,
+              macos_arch: x86_64 }
+          - { target: macos-arm64,         runner: macos-14, cc: clang,
+              macos_arch: arm64 }
+          # ---- Windows (MinGW) ----
+          - { target: windows-x86_64,      runner: windows-latest,
+              cc: gcc, mingw: MINGW64 }
+          - { target: windows-i686,        runner: windows-latest,
+              cc: gcc, mingw: MINGW32 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            V="${{ github.event.inputs.tag }}"
+          else
+            V="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$V" >> "$GITHUB_OUTPUT"
+          echo "numeric=${V#v}" >> "$GITHUB_OUTPUT"
+          echo "building version: $V"
+
+      - name: Install cross toolchain (Linux)
+        if: runner.os == 'Linux' && matrix.pkg != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ${{ matrix.pkg }}
+
+      - name: Install musl (static)
+        if: matrix.musl == true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Smoke-check cross compiler
+        if: runner.os == 'Linux' && matrix.pkg != ''
+        shell: bash
+        run: |
+          set -x
+          "${{ matrix.cc }}" --version | head -1
+          "${{ matrix.cc }}" -print-sysroot || true
+          echo 'int main(void){return 0;}' > /tmp/t.c
+          "${{ matrix.cc }}" /tmp/t.c -o /tmp/t
+          echo "cross smoke test: OK"
+
+      - name: Install GNU Make (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install make
+          echo "gmake version: $(gmake --version | head -1)"
+
+      - name: Setup MSYS2 (MINGW64)
+        if: matrix.mingw == 'MINGW64'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            make
+            zip
+
+      - name: Setup MSYS2 (MINGW32)
+        if: matrix.mingw == 'MINGW32'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: false
+          install: >-
+            mingw-w64-i686-gcc
+            make
+            zip
+
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          set -euo pipefail
+          MAKE=make
+          [ "$(uname -s)" = "Darwin" ] && MAKE=gmake
+          NPROC=$( (command -v nproc >/dev/null 2>&1 && nproc) \
+                || (getconf _NPROCESSORS_ONLN 2>/dev/null) \
+                || (sysctl -n hw.ncpu 2>/dev/null) || echo 2 )
+
+          echo "== toolchain =="
+          "$CC" --version | head -1
+          echo "== make =="
+          "$MAKE" --version | head -1
+          echo "== jobs =="
+          echo "-j$NPROC"
+
+          EXTRA_CFLAGS=""
+          EXTRA_LDFLAGS=""
+          if [ "$(uname -s)" = "Darwin" ] && [ -n "${{ matrix.macos_arch }}" ]; then
+            EXTRA_CFLAGS="-arch ${{ matrix.macos_arch }}"
+            EXTRA_LDFLAGS="-arch ${{ matrix.macos_arch }}"
+          fi
+
+          "$MAKE" clean
+
+          if [ "${{ matrix.musl }}" = "true" ]; then
+            "$MAKE" -j"$NPROC" CC="$CC" portable
+          else
+            "$MAKE" -j"$NPROC" CC="$CC" \
+                    EXTRA_CFLAGS="$EXTRA_CFLAGS" \
+                    EXTRA_LDFLAGS="$EXTRA_LDFLAGS" all
+          fi
+
+          [ -f codoco ] || { echo "::error::codoco binary not produced"; exit 1; }
+          "$MAKE" strip CC="$CC" || true
+          file codoco
+          ls -la codoco
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          NPROC=$(nproc || echo 2)
+          make clean
+          make -j"$NPROC" all
+          strip codoco.exe || true
+          ls -la codoco.exe
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          TAG="${{ steps.ver.outputs.tag }}"
+          STAGE="codoco-${TAG}-${{ matrix.target }}"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          cp codoco         "$STAGE/"
+          cp LICENSE-MIT    "$STAGE/"
+          cp LICENSE-APACHE "$STAGE/"
+          [ -d examples ]  && cp -r examples  "$STAGE/"
+          [ -f README.md ] && cp README.md    "$STAGE/"
+
+          tar -czf "out/${STAGE}.tar.gz" "$STAGE"
+          rm -rf "$STAGE"
+
+          HASH_TOOL="sha256sum"
+          command -v sha256sum >/dev/null 2>&1 || HASH_TOOL="shasum -a 256"
+          ( cd out && \
+            find . -maxdepth 1 -name '*.tar.gz' -type f -print0 \
+              | xargs -0 -r $HASH_TOOL \
+              > "checksums-${{ matrix.target }}.txt" )
+          ls -la out
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          TAG="${{ steps.ver.outputs.tag }}"
+          STAGE="codoco-${TAG}-${{ matrix.target }}"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          cp codoco.exe     "$STAGE/"
+          cp LICENSE-MIT    "$STAGE/"
+          cp LICENSE-APACHE "$STAGE/"
+          [ -d examples ]  && cp -r examples  "$STAGE/"
+          [ -f README.md ] && cp README.md    "$STAGE/"
+
+          zip -r "out/${STAGE}.zip" "$STAGE"
+          rm -rf "$STAGE"
+
+          ( cd out && sha256sum "codoco-${TAG}-${{ matrix.target }}.zip" \
+                        > "checksums-${{ matrix.target }}.txt" )
+          ls -la out
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: |
+            out/*.tar.gz
+            out/*.zip
+            out/checksums-*.txt
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  #  .deb packages
+  # ---------------------------------------------------------------------------
+  deb:
+    name: deb / ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64,   cc: gcc,                        pkg: "" }
+          - { arch: i386,    cc: i686-linux-gnu-gcc,         pkg: "gcc-i686-linux-gnu libc6-dev-i386-cross" }
+          - { arch: arm64,   cc: aarch64-linux-gnu-gcc,      pkg: "gcc-aarch64-linux-gnu libc6-dev-arm64-cross" }
+          - { arch: armhf,   cc: arm-linux-gnueabihf-gcc,    pkg: "gcc-arm-linux-gnueabihf libc6-dev-armhf-cross" }
+          - { arch: riscv64, cc: riscv64-linux-gnu-gcc,      pkg: "gcc-riscv64-linux-gnu libc6-dev-riscv64-cross" }
+          - { arch: ppc64el, cc: powerpc64le-linux-gnu-gcc,  pkg: "gcc-powerpc64le-linux-gnu libc6-dev-ppc64el-cross" }
+          - { arch: s390x,   cc: s390x-linux-gnu-gcc,        pkg: "gcc-s390x-linux-gnu libc6-dev-s390x-cross" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends dpkg-dev
+          [ -n "${{ matrix.pkg }}" ] && \
+            sudo apt-get install -y --no-install-recommends ${{ matrix.pkg }} || true
+
+      - name: Smoke-check compiler
+        if: matrix.pkg != ''
+        shell: bash
+        run: |
+          set -x
+          "${{ matrix.cc }}" --version | head -1
+          echo 'int main(void){return 0;}' > /tmp/t.c
+          "${{ matrix.cc }}" /tmp/t.c -o /tmp/t
+          echo OK
+
+      - name: Build .deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make -j"$(nproc)" CC="${{ matrix.cc }}" ARCH="${{ matrix.arch }}" deb
+          ls -la dist/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  #  .rpm packages
+  # ---------------------------------------------------------------------------
+  rpm:
+    name: rpm / ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  cc: gcc,                        pkg: "" }
+          - { arch: i686,    cc: i686-linux-gnu-gcc,         pkg: "gcc-i686-linux-gnu libc6-dev-i386-cross" }
+          - { arch: aarch64, cc: aarch64-linux-gnu-gcc,      pkg: "gcc-aarch64-linux-gnu libc6-dev-arm64-cross" }
+          - { arch: armv7hl, cc: arm-linux-gnueabihf-gcc,    pkg: "gcc-arm-linux-gnueabihf libc6-dev-armhf-cross" }
+          - { arch: riscv64, cc: riscv64-linux-gnu-gcc,      pkg: "gcc-riscv64-linux-gnu libc6-dev-riscv64-cross" }
+          - { arch: ppc64le, cc: powerpc64le-linux-gnu-gcc,  pkg: "gcc-powerpc64le-linux-gnu libc6-dev-ppc64el-cross" }
+          - { arch: s390x,   cc: s390x-linux-gnu-gcc,        pkg: "gcc-s390x-linux-gnu libc6-dev-s390x-cross" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rpmbuild + cross
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends rpm rpm2cpio
+          [ -n "${{ matrix.pkg }}" ] && \
+            sudo apt-get install -y --no-install-recommends ${{ matrix.pkg }} || true
+
+      - name: Build .rpm
+        shell: bash
+        env:
+          CC: ${{ matrix.cc }}
+          EXTRA_CFLAGS: ""
+          EXTRA_LDFLAGS: ""
+        run: |
+          set -euo pipefail
+          make clean
+          make -j"$(nproc)" \
+               CC="$CC" \
+               RPM_ARCH="${{ matrix.arch }}" \
+               rpm
+          echo "== output =="
+          ls -la dist/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  #  Single publish
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub Release
+    needs: [ binaries, deb, rpm ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine tag
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten dist/
+        shell: bash
+        run: |
+          set -e
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \
+                              -o -name '*.deb' -o -name '*.rpm' \
+                              -o -name 'checksums-*.txt' \) \
+              -exec mv -n {} dist/ \; 2>/dev/null || true
+          find dist -mindepth 1 -maxdepth 1 -type d \
+              -exec rm -rf {} + 2>/dev/null || true
+          echo "== artifacts =="
+          ls -la dist
+
+      - name: Combine checksums
+        shell: bash
+        run: |
+          set -e
+          cd dist
+          cat checksums-*.txt 2>/dev/null | sort -u > checksums.txt || true
+          rm -f checksums-*.txt
+          echo "== checksums.txt =="
+          cat checksums.txt || true
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "Codoco ${{ steps.ver.outputs.tag }}"
+          draft: false
+          prerelease: ${{ contains(steps.ver.outputs.tag, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+            dist/checksums.txt

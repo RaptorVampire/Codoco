@@ -1,0 +1,260 @@
+# =============================================================================
+#  Codoco -- screenshot workflow
+#
+#  On every push to main:
+#    1. build codoco
+#    2. generate a light-theme HTML report of the repo itself
+#    3. open it in pre-installed Chrome at A4-landscape size
+#    4. inject CSS that enlarges fonts / charts inside the same frame
+#    5. save as Screenshot.png
+#    6. commit and push it back to the repository
+# =============================================================================
+name: Screenshot
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'Screenshot.png'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  screenshot:
+    name: Report + Screenshot
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build codoco
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean || true
+          make -j"$(nproc)" all
+          ./codoco --version
+
+      - name: Generate report
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./codoco --html --by-file -o report.html .
+          ls -la report*.html
+
+      - name: Find Chrome
+        id: chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROME=""
+          for c in google-chrome google-chrome-stable chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then
+              CHROME="$(command -v "$c")"
+              break
+            fi
+          done
+          [ -n "$CHROME" ] || { echo "::error::no chrome"; exit 1; }
+          echo "path=$CHROME" >> "$GITHUB_OUTPUT"
+          "$CHROME" --version
+
+      - name: Install puppeteer-core
+        shell: bash
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: '1'
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: '1'
+        run: |
+          set -euo pipefail
+          rm -rf .screenshot-tools
+          mkdir -p .screenshot-tools
+          cd .screenshot-tools
+
+          cat > package.json <<'EOF'
+          {
+            "name": "codoco-screenshot",
+            "private": true,
+            "version": "0.0.0",
+            "dependencies": {
+              "puppeteer-core": "^23.0.0"
+            }
+          }
+          EOF
+
+          npm install --no-audit --no-fund --loglevel=error
+          node -e "console.log('puppeteer-core', require('puppeteer-core/package.json').version)"
+
+      # -----------------------------------------------------------------------
+      #  Screenshot:
+      #    - W x H      = A4 landscape at 96 dpi
+      #    - SCALE = 2  = full quality
+      #    - SCALE_UP   = multiplier for all font sizes / chart heights
+      # -----------------------------------------------------------------------
+      - name: Take screenshot
+        shell: bash
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+          WORKSPACE:   ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+
+          cat > .screenshot-tools/shot.js <<'EOF'
+          const puppeteer = require('puppeteer-core');
+          const path      = require('path');
+          const fs        = require('fs');
+
+          (async () => {
+            const W = 1123;       // A4 landscape @96 dpi
+            const H = 794;
+            const SCALE = 2;      // -> 2246 x 1588 final PNG
+            const SCALE_UP = 1.5; // multiply every size by this
+
+            const workspace = process.env.WORKSPACE || process.cwd();
+            const outPath   = path.join(workspace, 'Screenshot.png');
+
+            const candidates = [
+              'report-light.html',
+              'report-dark.html',
+              'report.html',
+            ].map(f => path.join(workspace, f));
+
+            const report = candidates.find(f => fs.existsSync(f));
+            if (!report) {
+              console.error('no report*.html found in', workspace);
+              console.error('ls:', fs.readdirSync(workspace));
+              process.exit(1);
+            }
+            const url = 'file://' + report;
+            console.log('chrome   :', process.env.CHROME_PATH);
+            console.log('rendering:', url);
+            console.log('scale up :', SCALE_UP);
+
+            const browser = await puppeteer.launch({
+              executablePath: process.env.CHROME_PATH,
+              headless: 'new',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--font-render-hinting=none',
+                '--hide-scrollbars',
+              ],
+            });
+
+            try {
+              const page = await browser.newPage();
+              await page.setViewport({
+                width: W,
+                height: H,
+                deviceScaleFactor: SCALE,
+              });
+
+              await page.emulateMediaType('print');
+
+              await page.goto(url, {
+                waitUntil: ['load', 'networkidle0'],
+                timeout: 60000,
+              });
+
+              // Directly scale up every size in the print CSS.
+              await page.evaluate((k) => {
+                const s = document.createElement('style');
+                s.id = 'codoco-bigger';
+                s.textContent = `
+                  @media print {
+                    html, body                { font-size: ${k*8}pt  !important; }
+                    .brand .name              { font-size: ${k*18}pt !important; }
+                    .brand .tag               { font-size: ${k*7.5}pt !important; }
+                    .meta                     { font-size: ${k*7.5}pt !important; }
+                    .meta code                { font-size: ${k*6}pt !important; }
+
+                    .stat                     { padding:    ${k*2}mm ${k*2.5}mm !important; }
+                    .stat .n                  { font-size: ${k*10}pt !important; }
+                    .stat .l                  { font-size: ${k*5.8}pt !important; }
+
+                    .panel                    { padding:   ${k*2}mm ${k*2.5}mm !important; }
+                    .panel h2                 { font-size: ${k*6.5}pt !important; }
+
+                    .donut-wrap               { max-width: ${k*52}mm !important; }
+                    .donut-center .big        { font-size: ${k*14}pt !important; }
+                    .donut-center .small      { font-size: ${k*5.5}pt !important; }
+
+                    .legend                   { font-size: ${k*6.5}pt !important; }
+                    .legend li i              { width: ${k*6}px !important;
+                                                height:${k*6}px !important; }
+                    .legend li .pc            { font-size: ${k*6}pt !important; }
+
+                    .chart-box .canvas-wrap   { height: ${k*36}mm !important; }
+                    .chart-box h3             { font-size: ${k*8}pt !important; }
+                    .chart-box .sub           { font-size: ${k*6.5}pt !important; }
+
+                    table                     { font-size: ${k*7}pt !important; }
+                    thead th                  { font-size: ${k*5.5}pt !important; }
+                    tbody td                  { font-size: ${k*7}pt !important; }
+
+                    footer                    { font-size: ${k*6.5}pt !important; }
+                  }
+                `;
+                document.head.appendChild(s);
+              }, SCALE_UP);
+
+              try { await page.evaluateHandle('document.fonts.ready'); } catch (e) {}
+              await new Promise(r => setTimeout(r, 800));
+
+              await page.screenshot({
+                path: outPath,
+                type: 'png',
+                fullPage: false,
+                captureBeyondViewport: false,
+                omitBackground: false,
+              });
+
+              console.log('Screenshot.png written ->', outPath);
+            } finally {
+              await browser.close();
+            }
+          })().catch(e => { console.error(e); process.exit(1); });
+          EOF
+
+          cd .screenshot-tools
+          node shot.js
+          cd ..
+
+          ls -la Screenshot.png
+          file Screenshot.png
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-artifacts
+          path: |
+            Screenshot.png
+            report-*.html
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Commit screenshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f Screenshot.png ]; then
+            echo "::error::Screenshot.png missing"
+            exit 1
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f Screenshot.png
+
+          if git diff --staged --quiet; then
+            echo "Screenshot.png unchanged; skipping commit"
+            exit 0
+          fi
+
+          git commit -m "docs: update Screenshot.png [skip ci]"
+          git push

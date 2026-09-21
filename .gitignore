@@ -1,0 +1,27 @@
+# build
+build/
+dist/
+*.o
+*.d
+*.a
+*.so
+codoco
+codoco.exe
+
+# reports
+codoco-report*.html
+*.pdf
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# local
+.env
+.local/
+
+.bak
